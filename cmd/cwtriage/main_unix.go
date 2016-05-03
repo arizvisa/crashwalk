@@ -19,6 +19,7 @@ import (
 )
 
 var (
+	seenDB        = flag.String("db", "crashwalk.db", "Database to write results to")
 	crashRoot     = flag.String("root", "", "Root directory to look for crashes")
 	matchPattern  = flag.String("match", "", "Match pattern for files ( go regex syntax )")
 	ignorePattern = flag.String("ignore", "", "Directory skip pattern ( go regex syntax )")
@@ -181,6 +182,7 @@ func main() {
 		Timeout:     *flagTimeout,
 		Tidy:        *flagTidy,
 		File:        *flagFile,
+		SeenDB:		 *seenDB,
 	}
 
 	cw, err := crashwalk.NewCrashwalk(config)
