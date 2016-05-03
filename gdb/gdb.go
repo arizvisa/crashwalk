@@ -12,8 +12,6 @@ import (
 	"bytes"
 	"fmt"
 	"github.com/bnagy/crashwalk/crash"
-	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
@@ -23,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"syscall"
 )
 
 // Engine is used to satisy the crashwalk.Debugger interface
@@ -34,15 +33,15 @@ var explDefaultPath = filepath.Join(usr.HomeDir, "/src/exploitable/exploitable/e
 
 // So classy. :<
 var gdbBatch = []string{
-	"run",
-	"source " + explDefaultPath, // TODO get from env? hardwire?
-	"echo <EXPLOITABLE>\n",
-	"exploitable -v",
-	"echo </EXPLOITABLE>\n",
-	"echo <REG>\n",
-	"info reg",
-	"echo </REG>\n",
-	"quit",
+	`run`,
+	`source ` + explDefaultPath, // TODO get from env? hardwire?
+	`echo <EXPLOITABLE>\n`,
+	`exploitable -v`,
+	`echo </EXPLOITABLE>\n`,
+	`echo <REG>\n`,
+	`info reg`,
+	`echo </REG>\n`,
+	`quit`,
 }
 var gdbPrefix = []string{"-q", "--batch"}
 var gdbPostfix = []string{"--args"}
@@ -376,18 +375,18 @@ func parse(raw []byte, cmd string) crash.Info {
 }
 
 func init() {
+	const env_variable = "CW_EXPLOITABLE"
+
 	//if env. variable is set, bypass default path for exploitable
-	if os.Getenv("CW_EXPLOITABLE") != "" {
-		explPath := filepath.Join(os.Getenv("CW_EXPLOITABLE"), "exploitable.py")
-		_, err := os.Stat(explPath)
-		gdbBatch[1] = "source " + explPath
-		if os.IsNotExist(err) {
-			log.Fatalf("Invalid exploitable path: %s", explPath)
+	explPath,found := os.LookupEnv(env_variable)
+	if found {
+		if _, err := os.Stat(explPath); os.IsNotExist(err) {
+			log.Fatalf("Invalid exploitable.py path defined in environment: %s (%s)", env_variable, err)
 		}
+		gdbBatch[1] = fmt.Sprintf("source %s", explPath)
 	} else {
-		_, err := os.Stat(explDefaultPath)
-		if os.IsNotExist(err) {
-			log.Fatalf("Could not find exploitable in default path: %s", explDefaultPath)
+		if _, err := os.Stat(explDefaultPath); os.IsNotExist(err) {
+			log.Fatalf("Could not find exploitable.py in default path: %s", err)
 		}
 	}
 	// build the commandline from the components
@@ -402,7 +401,6 @@ func init() {
 func (e *Engine) Run(command []string, filename string, memlimit, timeout int) (crash.Info, error) {
 
 	var cmd *exec.Cmd
-	var t *time.Timer
 	args := make([]string, len(gdbArgs))
 	copy(args, gdbArgs)
 
@@ -437,55 +435,43 @@ func (e *Engine) Run(command []string, filename string, memlimit, timeout int) (
 	}
 
 	cmd = exec.Command("gdb", args...)
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return crash.Info{}, fmt.Errorf("error creating stdout pipe: %s", err)
-	}
+
+	stdout := &bytes.Buffer{}
+	cmd.Stdout = stdout
 	// If there were no filename substitutions then the target must be
 	// expecting the file contents over stdin
-	var stdin io.WriteCloser
-	if sub == 0 {
-		stdin, err = cmd.StdinPipe()
-		if err != nil {
-			return crash.Info{}, fmt.Errorf("error creating stdin pipe: %s", err)
-		}
-	}
-
-	if err := cmd.Start(); err != nil {
-		return crash.Info{}, fmt.Errorf("error launching gdb: %s", err)
-	}
-
-	if timeout > 0 {
-		t = time.AfterFunc(
-			time.Duration(timeout)*time.Second,
-			func() {
-				cmd.Process.Kill()
-				fmt.Fprintf(os.Stderr, "[DEBUG] killed by timer!\n")
-			},
-		)
-	}
-
 	if sub == 0 {
 		f, err := os.Open(filename)
 		if err != nil {
 			// bizarre, because it was checked by crashwalk
 			return crash.Info{}, fmt.Errorf("error reading crashfile for target stdin: %s", err)
 		}
-		io.Copy(stdin, f)
-		stdin.Close()
+		cmd.Stdin = f
 	}
-	// We don't care about this error because we don't care about GDB's exit
-	// status (we just panic if we can't parse the output)
-	out, _ := ioutil.ReadAll(stdout)
-	cmd.Wait()
-	if t != nil {
-		t.Stop()
+
+	if timeout > 0 {
+		var t *time.Timer
+		t = time.AfterFunc(
+			time.Duration(timeout)*time.Second,
+			func() {
+				if cmd.Process.Signal(syscall.Signal(0)) == nil {
+					cmd.Process.Kill()
+					log.Printf("[DEBUG] killed by timer!\n")
+				}
+			},
+		)
+		defer t.Stop()
+	}
+
+	if err := cmd.Run(); err != nil {
+		return crash.Info{}, fmt.Errorf("Error running gdb: %s", err)
 	}
 
 	// Sometimes the inferior blats a huge string into gdb before it either
 	// exits or crashes, which causes problems with the 64k limit for token-
 	// size in scanner. This tries to seek ahead to the start of our canned
 	// output to avoid that.
+	out := stdout.Bytes()
 	start := bytes.Index(out, []byte("<EXPLOITABLE>"))
 
 	if start < 0 || len(out) == 0 || bytes.Contains(out, []byte("<REG>\n</REG>")) {
